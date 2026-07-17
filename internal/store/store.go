@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -14,18 +15,23 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
 )
 
-var openDB = sql.Open
+var (
+	openDB             = sql.Open
+	persistWALHookOnce sync.Once
+)
 
 // sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
 // constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
@@ -609,6 +615,62 @@ func (s *Store) commitHook(tx *sql.Tx) error {
 	return tx.Commit()
 }
 
+func storeDSN(dbPath string) string {
+	query := url.Values{}
+	for _, pragma := range []string{
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+		"foreign_keys(1)",
+	} {
+		query.Add("_pragma", pragma)
+	}
+	return dbPath + "?" + query.Encode()
+}
+
+func registerPersistWALHook() {
+	persistWALHookOnce.Do(func() {
+		sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
+			_ = enablePersistWAL(conn)
+			return nil
+		})
+	})
+}
+
+func enablePersistWAL(conn sqlite.ExecQuerierContext) error {
+	fc, ok := conn.(sqlite.FileControl)
+	if !ok {
+		return nil
+	}
+	_, err := fc.FileControlPersistWAL("main", 1)
+	return err
+}
+
+func primeConnection(db *sql.DB) error {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	return conn.Raw(func(driverConn any) error {
+		fc, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			log.Printf("[store] persistent WAL unavailable: driver connection %T does not implement sqlite.FileControl", driverConn)
+			return nil
+		}
+		mode, err := fc.FileControlPersistWAL("main", -1)
+		if err != nil {
+			log.Printf("[store] persistent WAL unavailable: %v", err)
+			return nil
+		}
+		if mode != 1 {
+			log.Printf("[store] persistent WAL not active (mode %d)", mode)
+		}
+		return nil
+	})
+}
+
 func New(cfg Config) (*Store, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
@@ -618,23 +680,15 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(cfg.DataDir, "engram.db")
-	db, err := openDB("sqlite", dbPath)
+	registerPersistWALHook()
+	db, err := openDB("sqlite", storeDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("engram: open database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-
-	// SQLite performance pragmas
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA foreign_keys = ON",
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return nil, fmt.Errorf("engram: pragma %q: %w", p, err)
-		}
+	if err := primeConnection(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("engram: open initial connection: %w", err)
 	}
 
 	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
@@ -659,22 +713,15 @@ func newWithoutRepair(cfg Config) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(cfg.DataDir, "engram.db")
-	db, err := openDB("sqlite", dbPath)
+	registerPersistWALHook()
+	db, err := openDB("sqlite", storeDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("engram: open database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA foreign_keys = ON",
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return nil, fmt.Errorf("engram: pragma %q: %w", p, err)
-		}
+	if err := primeConnection(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("engram: open initial connection: %w", err)
 	}
 
 	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
